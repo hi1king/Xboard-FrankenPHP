@@ -257,25 +257,13 @@ jobs:
           echo "--- build-context/docker/php/ ---"
           ls -la build-context/docker/php/
 
-      # ── 检测 DockerHub 凭据是否已配置 ──────────────────────────────
-      # secrets 上下文不能直接用于 with 表达式或裸 if 条件，
-      # 需先通过 step env 映射成普通输出变量。
-      - name: Detect registry targets
-        id: registries
+      # ── Login Registries ──
+      # secrets 上下文不能用于 with 表达式，先映射到 env 再判断
+      - name: Login to Docker Hub
         env:
           _DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
-        run: |
-          if [ -n "$_DH_USER" ]; then
-            echo "has_dockerhub=true"  >> $GITHUB_OUTPUT
-            echo "dockerhub_image=docker.io/$_DH_USER/${{ env.IMAGE_NAME }}" >> $GITHUB_OUTPUT
-          else
-            echo "has_dockerhub=false" >> $GITHUB_OUTPUT
-            echo "dockerhub_image="   >> $GITHUB_OUTPUT
-          fi
-
-      # ── Login Registries ──
-      - name: Login to Docker Hub
-        if: ${{ steps.registries.outputs.has_dockerhub == 'true' }}
+          _DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        if: ${{ env._DH_USER != '' }}
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -288,25 +276,73 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── Docker Metadata ──
-      - name: Generate Docker metadata
+      # ── 手动拼装 tags / labels，完全绕开 metadata-action ──────────
+      # metadata-action 对空 image 行报错；手动拼装可精确控制每一行。
+      - name: Build image tags and labels
         id: meta
-        uses: docker/metadata-action@v5
-        with:
-          # dockerhub_image 为空字符串时 metadata-action 会自动忽略该行
-          images: |
-            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
-            ${{ steps.registries.outputs.dockerhub_image }}
-          tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
-            type=raw,value=${{ needs.check-upstream.outputs.version_label }}
-            type=raw,value=${{ needs.check-upstream.outputs.upstream_sha }}
-            type=sha,prefix=sha-,format=short
-          labels: |
-            org.opencontainers.image.title=Xboard FrankenPHP
-            org.opencontainers.image.description=High-performance Xboard panel powered by FrankenPHP
-            org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPO }}
-            upstream.sha=${{ needs.check-upstream.outputs.upstream_sha }}
+        env:
+          _DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          OWNER: ${{ github.repository_owner }}
+          IMAGE: ${{ env.IMAGE_NAME }}
+          VERSION: ${{ needs.check-upstream.outputs.version_label }}
+          SHA: ${{ needs.check-upstream.outputs.upstream_sha }}
+          REF: ${{ github.ref }}
+          UPSTREAM_REPO: ${{ env.UPSTREAM_REPO }}
+        run: |
+          set -euo pipefail
+
+          GHCR_BASE="ghcr.io/${OWNER}/${IMAGE}"
+          SHORT_SHA="${SHA:0:7}"
+
+          # ── 收集所有 tag（每行一个完整镜像:tag）────────────────────
+          TAGS=""
+          add_tag() {
+            local base="$1" tag="$2"
+            TAGS="${TAGS}${base}:${tag}"$'
+'
+          }
+
+          # GHCR tags
+          add_tag "$GHCR_BASE" "$VERSION"
+          add_tag "$GHCR_BASE" "sha-${SHORT_SHA}"
+          if [ "$REF" = "refs/heads/main" ] || [ "$REF" = "refs/heads/master" ]; then
+            add_tag "$GHCR_BASE" "latest"
+          fi
+
+          # DockerHub tags（仅当凭据存在）
+          if [ -n "$_DH_USER" ]; then
+            DH_BASE="docker.io/${_DH_USER}/${IMAGE}"
+            add_tag "$DH_BASE" "$VERSION"
+            add_tag "$DH_BASE" "sha-${SHORT_SHA}"
+            if [ "$REF" = "refs/heads/main" ] || [ "$REF" = "refs/heads/master" ]; then
+              add_tag "$DH_BASE" "latest"
+            fi
+          fi
+
+          # 去掉末尾空行
+          TAGS="$(printf '%s' "$TAGS" | sed '/^[[:space:]]*$/d')"
+
+          # ── Labels ────────────────────────────────────────────────
+          LABELS="org.opencontainers.image.title=Xboard FrankenPHP
+          org.opencontainers.image.description=High-performance Xboard panel powered by FrankenPHP
+          org.opencontainers.image.source=https://github.com/${UPSTREAM_REPO}
+          upstream.sha=${SHA}"
+
+          # ── 写入多行 output（使用 heredoc 分隔符）────────────────
+          {
+            echo "tags<<__TAGS_EOF__"
+            printf '%s
+' "$TAGS"
+            echo "__TAGS_EOF__"
+            echo "labels<<__LABELS_EOF__"
+            printf '%s
+' "$LABELS"
+            echo "__LABELS_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "📦 Tags to push:"
+          printf '%s
+' "$TAGS"
 
       # ── Build & Push ──
       - name: Build and push
