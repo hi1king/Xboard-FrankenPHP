@@ -198,35 +198,21 @@ jobs:
           echo "✅ Cloned at SHA: $SHA"
           ls -la upstream/
 
-      # ── 组装 build-context（upstream + 我们的 FrankenPHP 文件）────────
+      # ── 组装 build-context：upstream 源码 + 自包含 Dockerfile ─────────
+      # Dockerfile 已通过 RUN heredoc 内联所有配置，无需额外文件
       - name: Assemble build context
         run: |
           set -euo pipefail
-
           [ -d upstream ] || { echo "❌ upstream dir missing"; exit 1; }
 
-          # 以 upstream 源码为基础
           mkdir -p build-context
           cp -a upstream/. build-context/
 
-          # 覆盖 Dockerfile
+          # 用自包含 Dockerfile 覆盖 upstream 原有的
           cp Dockerfile build-context/Dockerfile
 
-          # 逐文件写入 docker/，彻底避免 cp -r 的目录嵌套歧义
-          mkdir -p build-context/docker/php
-          cp docker/Caddyfile        build-context/docker/Caddyfile
-          cp docker/worker.php       build-context/docker/worker.php
-          cp docker/entrypoint.sh   build-context/docker/entrypoint.sh
-          cp docker/supervisord.conf build-context/docker/supervisord.conf
-          cp docker/php/php.ini      build-context/docker/php/php.ini
-          cp docker/php/opcache.ini  build-context/docker/php/opcache.ini
+          echo "✅ Build context ready ($(find build-context -type f | wc -l) files)"
 
-          # 可选：自定义 config/ 覆盖
-          [ -d config ] && cp -a config/. build-context/config/ || true
-
-          echo "✅ Build context assembled"
-          ls -la build-context/docker/
-          ls -la build-context/docker/php/
 
       # ── Login ───────────────────────────────────────────────────────
       - name: Login to Docker Hub
