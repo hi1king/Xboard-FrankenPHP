@@ -169,9 +169,25 @@ jobs:
           cp -r docker/ upstream/docker/ 2>/dev/null || true
           cp -r config/ upstream/config/ 2>/dev/null || true
 
+      # ── 检测 DockerHub 凭据是否已配置 ──────────────────────────────
+      # secrets 上下文不能直接用于 with 表达式或裸 if 条件，
+      # 需先通过 step env 映射成普通输出变量。
+      - name: Detect registry targets
+        id: registries
+        env:
+          _DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+        run: |
+          if [ -n "$_DH_USER" ]; then
+            echo "has_dockerhub=true"  >> $GITHUB_OUTPUT
+            echo "dockerhub_image=docker.io/$_DH_USER/${{ env.IMAGE_NAME }}" >> $GITHUB_OUTPUT
+          else
+            echo "has_dockerhub=false" >> $GITHUB_OUTPUT
+            echo "dockerhub_image="   >> $GITHUB_OUTPUT
+          fi
+
       # ── Login Registries ──
       - name: Login to Docker Hub
-        if: secrets.DOCKERHUB_USERNAME != ''
+        if: ${{ steps.registries.outputs.has_dockerhub == 'true' }}
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -189,9 +205,10 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
+          # dockerhub_image 为空字符串时 metadata-action 会自动忽略该行
           images: |
             ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
-            ${{ secrets.DOCKERHUB_USERNAME != '' && format('{0}/{1}/{2}', env.REGISTRY_DOCKERHUB, secrets.DOCKERHUB_USERNAME, env.IMAGE_NAME) || '' }}
+            ${{ steps.registries.outputs.dockerhub_image }}
           tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
             type=raw,value=${{ needs.check-upstream.outputs.version_label }}
