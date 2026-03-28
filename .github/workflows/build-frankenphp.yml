@@ -55,42 +55,96 @@ jobs:
         id: upstream
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_REPO: ${{ env.UPSTREAM_REPO }}
+          UPSTREAM_BRANCH: ${{ env.UPSTREAM_BRANCH }}
         run: |
-          REF="${{ github.event.inputs.upstream_ref }}"
+          set -euo pipefail
 
+          # ── 安全调用 gh api，4xx/5xx 或 JSON 错误体时返回空字符串 ──
+          safe_gh() {
+            local out
+            out=$(gh api "$1" --jq "$2" 2>/dev/null) || { echo ""; return 0; }
+            # gh api 遇到 404 仍返回 exit 0，输出是 JSON 对象 → 过滤掉
+            case "$out" in
+              "{"*) echo "" ;;
+              *) echo "$out" ;;
+            esac
+          }
+
+          # ── 验证是否是合法的 40 位 hex SHA ──
+          is_sha() { printf '%s' "$1" | grep -qE '^[0-9a-f]{40}$'; }
+
+          REF="${{ github.event.inputs.upstream_ref }}"
+          TAG=""
+          SHA=""
+          VERSION_LABEL=""
+
+          # ── 1. 确定目标 Tag ──────────────────────────────────────────
           if [ -z "$REF" ]; then
-            # 获取最新 release tag
-            TAG=$(gh api repos/${{ env.UPSTREAM_REPO }}/releases/latest \
-              --jq '.tag_name' 2>/dev/null || echo "")
+            echo "🔍 Querying latest release for $UPSTREAM_REPO ..."
+            TAG=$(safe_gh "repos/$UPSTREAM_REPO/releases/latest" ".tag_name")
 
             if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
-              echo "No release found, falling back to branch HEAD"
+              echo "⚠️  No release found, falling back to branch HEAD."
               TAG=""
+            else
+              echo "✅ Latest release tag: $TAG"
             fi
           else
             TAG="$REF"
+            echo "📌 Using user-supplied ref: $TAG"
           fi
 
-          # 获取对应 SHA
+          # ── 2. 解析 commit SHA ───────────────────────────────────────
           if [ -n "$TAG" ]; then
-            SHA=$(gh api repos/${{ env.UPSTREAM_REPO }}/git/ref/tags/$TAG \
-              --jq '.object.sha' 2>/dev/null || echo "")
-            # 如果是轻量 tag，sha 直接就是 commit sha；annotated tag 需要解引用
-            DEREF=$(gh api repos/${{ env.UPSTREAM_REPO }}/git/tags/$SHA \
-              --jq '.object.sha' 2>/dev/null || echo "$SHA")
-            SHA="${DEREF:-$SHA}"
+            # 通过 git/ref/tags/<tag> 获取 ref 指向的 sha
+            REF_SHA=$(safe_gh "repos/$UPSTREAM_REPO/git/ref/tags/$TAG" ".object.sha")
+
+            # 如果 git/ref 失败（如轻量 tag 不在 git db），用 commits API 兜底
+            if ! is_sha "$REF_SHA"; then
+              echo "⚠️  git/ref/tags failed, retrying via commits API ..."
+              REF_SHA=$(safe_gh "repos/$UPSTREAM_REPO/commits/$TAG" ".sha")
+            fi
+
+            if ! is_sha "$REF_SHA"; then
+              echo "❌ Cannot resolve SHA for tag: $TAG"
+              exit 1
+            fi
+
+            # annotated tag：object.type == "tag" 需再解一层
+            OBJ_TYPE=$(safe_gh "repos/$UPSTREAM_REPO/git/tags/$REF_SHA" ".object.type")
+            if [ "$OBJ_TYPE" = "commit" ]; then
+              COMMIT_SHA=$(safe_gh "repos/$UPSTREAM_REPO/git/tags/$REF_SHA" ".object.sha")
+              is_sha "$COMMIT_SHA" && SHA="$COMMIT_SHA" || SHA="$REF_SHA"
+            else
+              SHA="$REF_SHA"   # lightweight tag 或解引用失败，直接用
+            fi
+
             VERSION_LABEL="$TAG"
+
           else
-            SHA=$(gh api repos/${{ env.UPSTREAM_REPO }}/commits/${{ env.UPSTREAM_BRANCH }} \
-              --jq '.sha')
+            # ── 无 Tag → 取分支最新 commit SHA ──────────────────────────
+            echo "🔍 Fetching HEAD of branch: $UPSTREAM_BRANCH ..."
+            SHA=$(safe_gh "repos/$UPSTREAM_REPO/commits/$UPSTREAM_BRANCH" ".sha")
+
+            if ! is_sha "$SHA"; then
+              echo "❌ Cannot fetch HEAD SHA for branch: $UPSTREAM_BRANCH"
+              exit 1
+            fi
+
             SHORT_SHA="${SHA:0:7}"
-            VERSION_LABEL="main-$SHORT_SHA"
+            VERSION_LABEL="${UPSTREAM_BRANCH}-${SHORT_SHA}"
           fi
 
-          echo "sha=$SHA" >> $GITHUB_OUTPUT
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "version_label=$VERSION_LABEL" >> $GITHUB_OUTPUT
-          echo "📌 Upstream SHA: $SHA  |  Label: $VERSION_LABEL"
+          echo "📌 SHA: $SHA  |  Label: $VERSION_LABEL"
+
+          # ── 3. 写入 GITHUB_OUTPUT（严格 key=single-line-value 格式）──
+          {
+            printf 'sha=%s\n'            "$SHA"
+            printf 'tag=%s\n'            "$TAG"
+            printf 'version_label=%s\n'  "$VERSION_LABEL"
+          } >> "$GITHUB_OUTPUT"
+
 
       - name: Compare with last built SHA
         id: compare
