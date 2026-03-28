@@ -8,19 +8,19 @@ FROM composer:2.7 AS composer-deps
 
 WORKDIR /app
 
+# 先只复制清单文件，利用 Docker layer 缓存（代码变动时跳过 install）
 COPY composer.json composer.lock* ./
+COPY . .
+
+# --optimize-autoloader 在 install 结束时直接生成优化 classmap，
+# 无需再单独跑 dump-autoload，也不用 --classmap-authoritative
+# （后者会导致 Laravel Facade / 动态绑定在运行时找不到类）
 RUN composer install \
       --no-dev \
       --no-scripts \
-      --no-autoloader \
+      --optimize-autoloader \
       --prefer-dist \
       --ignore-platform-reqs
-
-COPY . .
-RUN composer dump-autoload \
-      --optimize \
-      --classmap-authoritative \
-      --no-dev
 
 # ── Stage 2: FrankenPHP Production Runtime ────────────────────────
 FROM dunglas/frankenphp:1-php8.3-alpine AS production
