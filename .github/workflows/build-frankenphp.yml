@@ -202,26 +202,40 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           SHA="${{ needs.check-upstream.outputs.upstream_sha }}"
           TAG="${{ needs.check-upstream.outputs.upstream_tag }}"
 
           if [ -n "$TAG" ]; then
+            # Tag 已知 → shallow clone，速度最快
             git clone --depth 1 --branch "$TAG" \
-              https://github.com/${{ env.UPSTREAM_REPO }}.git upstream
+              "https://github.com/${{ env.UPSTREAM_REPO }}.git" upstream
           else
-            git clone https://github.com/${{ env.UPSTREAM_REPO }}.git upstream
-            cd upstream && git checkout "$SHA"
+            # 无 Tag → clone 后用 git -C 在子目录内 checkout，不改变当前目录
+            git clone "https://github.com/${{ env.UPSTREAM_REPO }}.git" upstream
+            git -C upstream checkout "$SHA"
           fi
 
-          echo "✅ Upstream cloned at SHA: $SHA"
-          ls upstream/
+          echo "✅ Cloned at SHA: $SHA"
+          # 验证目录存在且有内容（在当前工作目录下）
+          ls -la upstream/
 
       # ── 合并自定义 Dockerfile 和配置 ──
       - name: Overlay custom FrankenPHP files
         run: |
+          set -euo pipefail
+          # 确认 upstream 目录存在
+          if [ ! -d upstream ]; then
+            echo "❌ upstream directory not found"
+            exit 1
+          fi
           cp Dockerfile upstream/Dockerfile
-          cp -r docker/ upstream/docker/ 2>/dev/null || true
-          cp -r config/ upstream/config/ 2>/dev/null || true
+          # docker/ 目录是我们自己维护的，覆盖上游
+          cp -r docker/ upstream/docker/
+          # config/ 如果本仓库有自定义配置则覆盖，否则跳过
+          [ -d config ] && cp -r config/ upstream/config/ || true
+          echo "✅ Overlay complete"
+          ls upstream/
 
       # ── 检测 DockerHub 凭据是否已配置 ──────────────────────────────
       # secrets 上下文不能直接用于 with 表达式或裸 if 条件，
