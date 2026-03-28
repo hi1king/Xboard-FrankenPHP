@@ -220,22 +220,42 @@ jobs:
           # 验证目录存在且有内容（在当前工作目录下）
           ls -la upstream/
 
-      # ── 合并自定义 Dockerfile 和配置 ──
-      - name: Overlay custom FrankenPHP files
+      # ── 组装独立的 build-context 目录，避免与 upstream 已有目录冲突 ──
+      - name: Assemble build context
         run: |
           set -euo pipefail
-          # 确认 upstream 目录存在
+
           if [ ! -d upstream ]; then
             echo "❌ upstream directory not found"
             exit 1
           fi
-          cp Dockerfile upstream/Dockerfile
-          # docker/ 目录是我们自己维护的，覆盖上游
-          cp -r docker/ upstream/docker/
-          # config/ 如果本仓库有自定义配置则覆盖，否则跳过
-          [ -d config ] && cp -r config/ upstream/config/ || true
-          echo "✅ Overlay complete"
-          ls upstream/
+
+          # 1. 用 upstream 源码作为基础
+          mkdir -p build-context
+          cp -a upstream/. build-context/
+
+          # 2. 覆盖 Dockerfile（我们维护的 FrankenPHP 版本）
+          cp Dockerfile build-context/Dockerfile
+
+          # 3. 强制写入 docker/ 辅助文件（逐个文件，避免 cp -r 目录嵌套问题）
+          mkdir -p build-context/docker/php
+          cp docker/Caddyfile          build-context/docker/Caddyfile
+          cp docker/worker.php         build-context/docker/worker.php
+          cp docker/entrypoint.sh      build-context/docker/entrypoint.sh
+          cp docker/supervisord.conf   build-context/docker/supervisord.conf
+          cp docker/php/php.ini        build-context/docker/php/php.ini
+          cp docker/php/opcache.ini    build-context/docker/php/opcache.ini
+
+          # 4. 可选：自定义 config/ 覆盖
+          if [ -d config ]; then
+            cp -a config/. build-context/config/
+          fi
+
+          echo "✅ Build context assembled"
+          echo "--- build-context/docker/ ---"
+          ls -la build-context/docker/
+          echo "--- build-context/docker/php/ ---"
+          ls -la build-context/docker/php/
 
       # ── 检测 DockerHub 凭据是否已配置 ──────────────────────────────
       # secrets 上下文不能直接用于 with 表达式或裸 if 条件，
@@ -292,8 +312,8 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: ./upstream
-          file: ./upstream/Dockerfile
+          context: ./build-context
+          file: ./build-context/Dockerfile
           platforms: ${{ matrix.platform }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
