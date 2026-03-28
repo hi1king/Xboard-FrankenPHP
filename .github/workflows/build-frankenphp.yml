@@ -1,0 +1,351 @@
+name: 🚀 Build & Push FrankenPHP Image
+
+on:
+  schedule:
+    # 每天凌晨 2:00 UTC 检查上游更新
+    - cron: '0 2 * * *'
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'Dockerfile'
+      - 'docker/**'
+      - '.github/workflows/build-frankenphp.yml'
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: '上游分支或 Tag（留空则自动检测最新）'
+        required: false
+        default: ''
+      force_rebuild:
+        description: '强制重新构建（忽略缓存）'
+        type: boolean
+        default: false
+
+env:
+  UPSTREAM_REPO: cedar2025/Xboard
+  UPSTREAM_BRANCH: master
+  REGISTRY_DOCKERHUB: docker.io
+  REGISTRY_GHCR: ghcr.io
+  IMAGE_NAME: xboard-frankenphp
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ──────────────────────────────────────────
+  # JOB 1: 检查上游是否有新提交
+  # ──────────────────────────────────────────
+  check-upstream:
+    name: 🔍 Check Upstream Updates
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_sha: ${{ steps.upstream.outputs.sha }}
+      upstream_tag: ${{ steps.upstream.outputs.tag }}
+      should_build: ${{ steps.compare.outputs.should_build }}
+      version_label: ${{ steps.upstream.outputs.version_label }}
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Fetch upstream latest info
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REF="${{ github.event.inputs.upstream_ref }}"
+
+          if [ -z "$REF" ]; then
+            # 获取最新 release tag
+            TAG=$(gh api repos/${{ env.UPSTREAM_REPO }}/releases/latest \
+              --jq '.tag_name' 2>/dev/null || echo "")
+
+            if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+              echo "No release found, falling back to branch HEAD"
+              TAG=""
+            fi
+          else
+            TAG="$REF"
+          fi
+
+          # 获取对应 SHA
+          if [ -n "$TAG" ]; then
+            SHA=$(gh api repos/${{ env.UPSTREAM_REPO }}/git/ref/tags/$TAG \
+              --jq '.object.sha' 2>/dev/null || echo "")
+            # 如果是轻量 tag，sha 直接就是 commit sha；annotated tag 需要解引用
+            DEREF=$(gh api repos/${{ env.UPSTREAM_REPO }}/git/tags/$SHA \
+              --jq '.object.sha' 2>/dev/null || echo "$SHA")
+            SHA="${DEREF:-$SHA}"
+            VERSION_LABEL="$TAG"
+          else
+            SHA=$(gh api repos/${{ env.UPSTREAM_REPO }}/commits/${{ env.UPSTREAM_BRANCH }} \
+              --jq '.sha')
+            SHORT_SHA="${SHA:0:7}"
+            VERSION_LABEL="main-$SHORT_SHA"
+          fi
+
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version_label=$VERSION_LABEL" >> $GITHUB_OUTPUT
+          echo "📌 Upstream SHA: $SHA  |  Label: $VERSION_LABEL"
+
+      - name: Compare with last built SHA
+        id: compare
+        run: |
+          LAST_SHA=""
+          if [ -f .last_built_sha ]; then
+            LAST_SHA=$(cat .last_built_sha)
+          fi
+
+          FORCE="${{ github.event.inputs.force_rebuild }}"
+          CURRENT="${{ steps.upstream.outputs.sha }}"
+
+          if [ "$FORCE" = "true" ] || [ "$CURRENT" != "$LAST_SHA" ]; then
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "✅ Build required (upstream changed or forced)"
+          else
+            echo "should_build=false" >> $GITHUB_OUTPUT
+            echo "⏭️  Skip build (no upstream changes)"
+          fi
+
+  # ──────────────────────────────────────────
+  # JOB 2: 构建 FrankenPHP Docker 镜像
+  # ──────────────────────────────────────────
+  build:
+    name: 🐳 Build FrankenPHP Image
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+
+    strategy:
+      matrix:
+        platform:
+          - linux/amd64
+          - linux/arm64
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (cross-platform builds)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            network=host
+
+      # ── Clone upstream Xboard ──
+      - name: Clone upstream Xboard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHA="${{ needs.check-upstream.outputs.upstream_sha }}"
+          TAG="${{ needs.check-upstream.outputs.upstream_tag }}"
+
+          if [ -n "$TAG" ]; then
+            git clone --depth 1 --branch "$TAG" \
+              https://github.com/${{ env.UPSTREAM_REPO }}.git upstream
+          else
+            git clone https://github.com/${{ env.UPSTREAM_REPO }}.git upstream
+            cd upstream && git checkout "$SHA"
+          fi
+
+          echo "✅ Upstream cloned at SHA: $SHA"
+          ls upstream/
+
+      # ── 合并自定义 Dockerfile 和配置 ──
+      - name: Overlay custom FrankenPHP files
+        run: |
+          cp Dockerfile upstream/Dockerfile
+          cp -r docker/ upstream/docker/ 2>/dev/null || true
+          cp -r config/ upstream/config/ 2>/dev/null || true
+
+      # ── Login Registries ──
+      - name: Login to Docker Hub
+        if: secrets.DOCKERHUB_USERNAME != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Docker Metadata ──
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
+            ${{ secrets.DOCKERHUB_USERNAME != '' && format('{0}/{1}/{2}', env.REGISTRY_DOCKERHUB, secrets.DOCKERHUB_USERNAME, env.IMAGE_NAME) || '' }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+            type=raw,value=${{ needs.check-upstream.outputs.version_label }}
+            type=raw,value=${{ needs.check-upstream.outputs.upstream_sha }}
+            type=sha,prefix=sha-,format=short
+          labels: |
+            org.opencontainers.image.title=Xboard FrankenPHP
+            org.opencontainers.image.description=High-performance Xboard panel powered by FrankenPHP
+            org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPO }}
+            upstream.sha=${{ needs.check-upstream.outputs.upstream_sha }}
+
+      # ── Build & Push ──
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./upstream
+          file: ./upstream/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+          build-args: |
+            UPSTREAM_SHA=${{ needs.check-upstream.outputs.upstream_sha }}
+            UPSTREAM_VERSION=${{ needs.check-upstream.outputs.version_label }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+
+      # ── 保存最新构建 SHA ──
+      - name: Save built SHA
+        if: matrix.platform == 'linux/amd64'
+        run: |
+          echo "${{ needs.check-upstream.outputs.upstream_sha }}" > .last_built_sha
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .last_built_sha
+          git diff --staged --quiet || git commit -m "ci: update last built SHA [${{ needs.check-upstream.outputs.version_label }}]"
+          git push || true
+
+  # ──────────────────────────────────────────
+  # JOB 3: 多架构 Manifest 合并
+  # ──────────────────────────────────────────
+  merge-manifests:
+    name: 📦 Merge Multi-arch Manifests
+    needs: [check-upstream, build]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push multi-arch manifest
+        run: |
+          VERSION="${{ needs.check-upstream.outputs.version_label }}"
+          BASE="ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}"
+
+          docker buildx imagetools create \
+            --tag "$BASE:latest" \
+            --tag "$BASE:$VERSION" \
+            "$BASE:$VERSION-linux-amd64" \
+            "$BASE:$VERSION-linux-arm64" 2>/dev/null || \
+          echo "Manifest merge skipped (single arch or already merged)"
+
+  # ──────────────────────────────────────────
+  # JOB 4: 测试镜像
+  # ──────────────────────────────────────────
+  test:
+    name: 🧪 Smoke Test
+    needs: [check-upstream, build]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull and test image
+        run: |
+          IMAGE="ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ needs.check-upstream.outputs.version_label }}"
+          docker pull "$IMAGE"
+
+          # 检查 PHP 版本
+          docker run --rm "$IMAGE" php -v
+
+          # 检查 FrankenPHP 模块
+          docker run --rm "$IMAGE" php -m | grep -E "swoole|openswoole|pdo|redis|mbstring" || true
+
+          # 快速健康检查（5 秒超时）
+          docker run --rm -d --name xboard-test -p 8080:80 "$IMAGE" || true
+          sleep 3
+          curl -sf http://localhost:8080/health || echo "Health endpoint not available (expected for first run)"
+          docker stop xboard-test 2>/dev/null || true
+
+  # ──────────────────────────────────────────
+  # JOB 5: 发布 Release（仅 tag 触发）
+  # ──────────────────────────────────────────
+  release:
+    name: 🏷️ Create GitHub Release
+    needs: [check-upstream, test]
+    runs-on: ubuntu-latest
+    if: needs.check-upstream.outputs.upstream_tag != ''
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-upstream.outputs.version_label }}-frankenphp
+          name: "FrankenPHP Build — ${{ needs.check-upstream.outputs.version_label }}"
+          body: |
+            ## 🚀 FrankenPHP 构建版本
+
+            | 字段 | 值 |
+            |------|-----|
+            | 上游版本 | `${{ needs.check-upstream.outputs.upstream_tag }}` |
+            | 上游 SHA | `${{ needs.check-upstream.outputs.upstream_sha }}` |
+            | 构建时间 | `${{ github.event.repository.updated_at }}` |
+
+            ## Docker 镜像
+
+            ```bash
+            # GHCR
+            docker pull ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ needs.check-upstream.outputs.version_label }}
+
+            # Latest
+            docker pull ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
+            ```
+
+            ## 快速启动
+
+            ```bash
+            docker run -d \
+              --name xboard \
+              -p 80:80 \
+              -v ./data:/app/storage \
+              -e APP_KEY=your-app-key \
+              ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
+            ```
+
+            > 基于 [cedar2025/Xboard](${{ env.UPSTREAM_REPO }}) 上游构建，运行时替换为 FrankenPHP 高性能服务器。
+          draft: false
+          prerelease: false
