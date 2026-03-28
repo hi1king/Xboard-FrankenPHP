@@ -2,7 +2,6 @@ name: 🚀 Build & Push FrankenPHP Image
 
 on:
   schedule:
-    # 每天凌晨 2:00 UTC 检查上游更新
     - cron: '0 2 * * *'
   push:
     branches:
@@ -15,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       upstream_ref:
-        description: '上游分支或 Tag（留空则自动检测最新）'
+        description: '上游分支或 Tag（留空则自动检测最新 Release）'
         required: false
         default: ''
       force_rebuild:
@@ -26,8 +25,6 @@ on:
 env:
   UPSTREAM_REPO: cedar2025/Xboard
   UPSTREAM_BRANCH: master
-  REGISTRY_DOCKERHUB: docker.io
-  REGISTRY_GHCR: ghcr.io
   IMAGE_NAME: xboard-frankenphp
 
 concurrency:
@@ -35,17 +32,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ──────────────────────────────────────────
-  # JOB 1: 检查上游是否有新提交
-  # ──────────────────────────────────────────
+  # ════════════════════════════════════════════════════════════════
+  # JOB 1 — 检查上游是否有新提交
+  # ════════════════════════════════════════════════════════════════
   check-upstream:
     name: 🔍 Check Upstream Updates
     runs-on: ubuntu-latest
     outputs:
-      upstream_sha: ${{ steps.upstream.outputs.sha }}
-      upstream_tag: ${{ steps.upstream.outputs.tag }}
-      should_build: ${{ steps.compare.outputs.should_build }}
-      version_label: ${{ steps.upstream.outputs.version_label }}
+      upstream_sha:   ${{ steps.upstream.outputs.sha }}
+      upstream_tag:   ${{ steps.upstream.outputs.tag }}
+      version_label:  ${{ steps.upstream.outputs.version_label }}
+      should_build:   ${{ steps.compare.outputs.should_build }}
 
     steps:
       - name: Checkout this repo
@@ -54,122 +51,110 @@ jobs:
       - name: Fetch upstream latest info
         id: upstream
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          UPSTREAM_REPO: ${{ env.UPSTREAM_REPO }}
+          GH_TOKEN:        ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_REPO:   ${{ env.UPSTREAM_REPO }}
           UPSTREAM_BRANCH: ${{ env.UPSTREAM_BRANCH }}
         run: |
           set -euo pipefail
 
-          # ── 安全调用 gh api，4xx/5xx 或 JSON 错误体时返回空字符串 ──
+          # 安全调用 gh api：404 时 gh 仍返回 exit 0 且输出 JSON 错误体，需过滤
           safe_gh() {
             local out
-            out=$(gh api "$1" --jq "$2" 2>/dev/null) || { echo ""; return 0; }
-            # gh api 遇到 404 仍返回 exit 0，输出是 JSON 对象 → 过滤掉
+            out=$(gh api "$1" --jq "$2" 2>/dev/null) || { printf ''; return 0; }
             case "$out" in
-              "{"*) echo "" ;;
-              *) echo "$out" ;;
+              "{"*) printf '' ;;   # JSON 错误体 → 返回空
+              *)    printf '%s' "$out" ;;
             esac
           }
 
-          # ── 验证是否是合法的 40 位 hex SHA ──
+          # 验证 40 位 hex SHA
           is_sha() { printf '%s' "$1" | grep -qE '^[0-9a-f]{40}$'; }
 
-          REF="${{ github.event.inputs.upstream_ref }}"
+          INPUT_REF="${{ github.event.inputs.upstream_ref }}"
           TAG=""
           SHA=""
           VERSION_LABEL=""
 
-          # ── 1. 确定目标 Tag ──────────────────────────────────────────
-          if [ -z "$REF" ]; then
-            echo "🔍 Querying latest release for $UPSTREAM_REPO ..."
-            TAG=$(safe_gh "repos/$UPSTREAM_REPO/releases/latest" ".tag_name")
-
+          # ── 1. 确定目标 Tag ─────────────────────────────────────────────
+          if [ -z "$INPUT_REF" ]; then
+            echo "🔍 Querying latest release for ${UPSTREAM_REPO} ..."
+            TAG=$(safe_gh "repos/${UPSTREAM_REPO}/releases/latest" ".tag_name")
             if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
-              echo "⚠️  No release found, falling back to branch HEAD."
+              echo "⚠️  No release found, will use branch HEAD."
               TAG=""
             else
-              echo "✅ Latest release tag: $TAG"
+              echo "✅ Latest release tag: ${TAG}"
             fi
           else
-            TAG="$REF"
-            echo "📌 Using user-supplied ref: $TAG"
+            TAG="$INPUT_REF"
+            echo "📌 Using user-supplied ref: ${TAG}"
           fi
 
-          # ── 2. 解析 commit SHA ───────────────────────────────────────
+          # ── 2. 解析 commit SHA ──────────────────────────────────────────
           if [ -n "$TAG" ]; then
-            # 通过 git/ref/tags/<tag> 获取 ref 指向的 sha
-            REF_SHA=$(safe_gh "repos/$UPSTREAM_REPO/git/ref/tags/$TAG" ".object.sha")
+            REF_SHA=$(safe_gh "repos/${UPSTREAM_REPO}/git/ref/tags/${TAG}" ".object.sha")
 
-            # 如果 git/ref 失败（如轻量 tag 不在 git db），用 commits API 兜底
+            # git/ref 失败时用 commits API 兜底（部分 lightweight tag）
             if ! is_sha "$REF_SHA"; then
               echo "⚠️  git/ref/tags failed, retrying via commits API ..."
-              REF_SHA=$(safe_gh "repos/$UPSTREAM_REPO/commits/$TAG" ".sha")
+              REF_SHA=$(safe_gh "repos/${UPSTREAM_REPO}/commits/${TAG}" ".sha")
             fi
 
             if ! is_sha "$REF_SHA"; then
-              echo "❌ Cannot resolve SHA for tag: $TAG"
+              echo "❌ Cannot resolve SHA for tag: ${TAG}"
               exit 1
             fi
 
-            # annotated tag：object.type == "tag" 需再解一层
-            OBJ_TYPE=$(safe_gh "repos/$UPSTREAM_REPO/git/tags/$REF_SHA" ".object.type")
+            # annotated tag 需再解一层
+            OBJ_TYPE=$(safe_gh "repos/${UPSTREAM_REPO}/git/tags/${REF_SHA}" ".object.type")
             if [ "$OBJ_TYPE" = "commit" ]; then
-              COMMIT_SHA=$(safe_gh "repos/$UPSTREAM_REPO/git/tags/$REF_SHA" ".object.sha")
-              is_sha "$COMMIT_SHA" && SHA="$COMMIT_SHA" || SHA="$REF_SHA"
+              COMMIT_SHA=$(safe_gh "repos/${UPSTREAM_REPO}/git/tags/${REF_SHA}" ".object.sha")
+              if is_sha "$COMMIT_SHA"; then SHA="$COMMIT_SHA"; else SHA="$REF_SHA"; fi
             else
-              SHA="$REF_SHA"   # lightweight tag 或解引用失败，直接用
+              SHA="$REF_SHA"
             fi
-
             VERSION_LABEL="$TAG"
 
           else
-            # ── 无 Tag → 取分支最新 commit SHA ──────────────────────────
-            echo "🔍 Fetching HEAD of branch: $UPSTREAM_BRANCH ..."
-            SHA=$(safe_gh "repos/$UPSTREAM_REPO/commits/$UPSTREAM_BRANCH" ".sha")
-
+            echo "🔍 Fetching HEAD of branch: ${UPSTREAM_BRANCH} ..."
+            SHA=$(safe_gh "repos/${UPSTREAM_REPO}/commits/${UPSTREAM_BRANCH}" ".sha")
             if ! is_sha "$SHA"; then
-              echo "❌ Cannot fetch HEAD SHA for branch: $UPSTREAM_BRANCH"
+              echo "❌ Cannot fetch HEAD SHA for branch: ${UPSTREAM_BRANCH}"
               exit 1
             fi
-
             SHORT_SHA="${SHA:0:7}"
             VERSION_LABEL="${UPSTREAM_BRANCH}-${SHORT_SHA}"
           fi
 
-          echo "📌 SHA: $SHA  |  Label: $VERSION_LABEL"
+          echo "📌 SHA: ${SHA}  |  Label: ${VERSION_LABEL}"
 
-          # ── 3. 写入 GITHUB_OUTPUT（严格 key=single-line-value 格式）──
-          {
-            printf 'sha=%s\n'            "$SHA"
-            printf 'tag=%s\n'            "$TAG"
-            printf 'version_label=%s\n'  "$VERSION_LABEL"
-          } >> "$GITHUB_OUTPUT"
-
+          # ── 3. 写入 GITHUB_OUTPUT ───────────────────────────────────────
+          printf 'sha=%s\n'           "$SHA"           >> "$GITHUB_OUTPUT"
+          printf 'tag=%s\n'           "$TAG"           >> "$GITHUB_OUTPUT"
+          printf 'version_label=%s\n' "$VERSION_LABEL" >> "$GITHUB_OUTPUT"
 
       - name: Compare with last built SHA
         id: compare
         run: |
           LAST_SHA=""
-          if [ -f .last_built_sha ]; then
-            LAST_SHA=$(cat .last_built_sha)
-          fi
+          [ -f .last_built_sha ] && LAST_SHA=$(cat .last_built_sha)
 
           FORCE="${{ github.event.inputs.force_rebuild }}"
           CURRENT="${{ steps.upstream.outputs.sha }}"
 
           if [ "$FORCE" = "true" ] || [ "$CURRENT" != "$LAST_SHA" ]; then
-            echo "should_build=true" >> $GITHUB_OUTPUT
-            echo "✅ Build required (upstream changed or forced)"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Build required"
           else
-            echo "should_build=false" >> $GITHUB_OUTPUT
-            echo "⏭️  Skip build (no upstream changes)"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "⏭️  No upstream changes, skipping build"
           fi
 
-  # ──────────────────────────────────────────
-  # JOB 2: 构建 FrankenPHP Docker 镜像
-  # ──────────────────────────────────────────
+  # ════════════════════════════════════════════════════════════════
+  # JOB 2 — 构建 FrankenPHP Docker 镜像（多架构并行）
+  # ════════════════════════════════════════════════════════════════
   build:
-    name: 🐳 Build FrankenPHP Image
+    name: 🐳 Build FrankenPHP Image (${{ matrix.platform }})
     needs: check-upstream
     if: needs.check-upstream.outputs.should_build == 'true'
     runs-on: ubuntu-latest
@@ -179,6 +164,7 @@ jobs:
       id-token: write
 
     strategy:
+      fail-fast: false
       matrix:
         platform:
           - linux/amd64
@@ -188,82 +174,65 @@ jobs:
       - name: Checkout this repo
         uses: actions/checkout@v4
 
-      - name: Set up QEMU (cross-platform builds)
+      - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-        with:
-          driver-opts: |
-            network=host
 
-      # ── Clone upstream Xboard ──
+      # ── Clone upstream ──────────────────────────────────────────────
       - name: Clone upstream Xboard
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           SHA="${{ needs.check-upstream.outputs.upstream_sha }}"
           TAG="${{ needs.check-upstream.outputs.upstream_tag }}"
 
           if [ -n "$TAG" ]; then
-            # Tag 已知 → shallow clone，速度最快
             git clone --depth 1 --branch "$TAG" \
               "https://github.com/${{ env.UPSTREAM_REPO }}.git" upstream
           else
-            # 无 Tag → clone 后用 git -C 在子目录内 checkout，不改变当前目录
             git clone "https://github.com/${{ env.UPSTREAM_REPO }}.git" upstream
             git -C upstream checkout "$SHA"
           fi
 
           echo "✅ Cloned at SHA: $SHA"
-          # 验证目录存在且有内容（在当前工作目录下）
           ls -la upstream/
 
-      # ── 组装独立的 build-context 目录，避免与 upstream 已有目录冲突 ──
+      # ── 组装 build-context（upstream + 我们的 FrankenPHP 文件）────────
       - name: Assemble build context
         run: |
           set -euo pipefail
 
-          if [ ! -d upstream ]; then
-            echo "❌ upstream directory not found"
-            exit 1
-          fi
+          [ -d upstream ] || { echo "❌ upstream dir missing"; exit 1; }
 
-          # 1. 用 upstream 源码作为基础
+          # 以 upstream 源码为基础
           mkdir -p build-context
           cp -a upstream/. build-context/
 
-          # 2. 覆盖 Dockerfile（我们维护的 FrankenPHP 版本）
+          # 覆盖 Dockerfile
           cp Dockerfile build-context/Dockerfile
 
-          # 3. 强制写入 docker/ 辅助文件（逐个文件，避免 cp -r 目录嵌套问题）
+          # 逐文件写入 docker/，彻底避免 cp -r 的目录嵌套歧义
           mkdir -p build-context/docker/php
-          cp docker/Caddyfile          build-context/docker/Caddyfile
-          cp docker/worker.php         build-context/docker/worker.php
-          cp docker/entrypoint.sh      build-context/docker/entrypoint.sh
-          cp docker/supervisord.conf   build-context/docker/supervisord.conf
-          cp docker/php/php.ini        build-context/docker/php/php.ini
-          cp docker/php/opcache.ini    build-context/docker/php/opcache.ini
+          cp docker/Caddyfile        build-context/docker/Caddyfile
+          cp docker/worker.php       build-context/docker/worker.php
+          cp docker/entrypoint.sh   build-context/docker/entrypoint.sh
+          cp docker/supervisord.conf build-context/docker/supervisord.conf
+          cp docker/php/php.ini      build-context/docker/php/php.ini
+          cp docker/php/opcache.ini  build-context/docker/php/opcache.ini
 
-          # 4. 可选：自定义 config/ 覆盖
-          if [ -d config ]; then
-            cp -a config/. build-context/config/
-          fi
+          # 可选：自定义 config/ 覆盖
+          [ -d config ] && cp -a config/. build-context/config/ || true
 
           echo "✅ Build context assembled"
-          echo "--- build-context/docker/ ---"
           ls -la build-context/docker/
-          echo "--- build-context/docker/php/ ---"
           ls -la build-context/docker/php/
 
-      # ── Login Registries ──
-      # secrets 上下文不能用于 with 表达式，先映射到 env 再判断
+      # ── Login ───────────────────────────────────────────────────────
       - name: Login to Docker Hub
+        if: ${{ env.DOCKERHUB_USERNAME != '' }}
         env:
-          _DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
-          _DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-        if: ${{ env._DH_USER != '' }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -276,105 +245,92 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── 手动拼装 tags / labels，完全绕开 metadata-action ──────────
-      # metadata-action 对空 image 行报错；手动拼装可精确控制每一行。
+      # ── 手动拼装 tags/labels（绕开 metadata-action 的空行 bug）────────
       - name: Build image tags and labels
         id: meta
         env:
-          _DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
-          OWNER: ${{ github.repository_owner }}
-          IMAGE: ${{ env.IMAGE_NAME }}
-          VERSION: ${{ needs.check-upstream.outputs.version_label }}
-          SHA: ${{ needs.check-upstream.outputs.upstream_sha }}
-          REF: ${{ github.ref }}
+          DH_USER:       ${{ secrets.DOCKERHUB_USERNAME }}
+          OWNER:         ${{ github.repository_owner }}
+          IMAGE:         ${{ env.IMAGE_NAME }}
+          VERSION:       ${{ needs.check-upstream.outputs.version_label }}
+          SHA:           ${{ needs.check-upstream.outputs.upstream_sha }}
+          REF:           ${{ github.ref }}
           UPSTREAM_REPO: ${{ env.UPSTREAM_REPO }}
         run: |
           set -euo pipefail
 
-          GHCR_BASE="ghcr.io/${OWNER}/${IMAGE}"
-          SHORT_SHA="${SHA:0:7}"
-
-          # ── 收集所有 tag（每行一个完整镜像:tag）────────────────────
-          TAGS=""
-          add_tag() {
-            local base="$1" tag="$2"
-            TAGS="${TAGS}${base}:${tag}"$'
-'
-          }
-
-          # GHCR tags
-          add_tag "$GHCR_BASE" "$VERSION"
-          add_tag "$GHCR_BASE" "sha-${SHORT_SHA}"
+          GHCR="ghcr.io/${OWNER}/${IMAGE}"
+          SHORT="${SHA:0:7}"
+          IS_DEFAULT_BRANCH=false
           if [ "$REF" = "refs/heads/main" ] || [ "$REF" = "refs/heads/master" ]; then
-            add_tag "$GHCR_BASE" "latest"
+            IS_DEFAULT_BRANCH=true
           fi
 
-          # DockerHub tags（仅当凭据存在）
-          if [ -n "$_DH_USER" ]; then
-            DH_BASE="docker.io/${_DH_USER}/${IMAGE}"
-            add_tag "$DH_BASE" "$VERSION"
-            add_tag "$DH_BASE" "sha-${SHORT_SHA}"
-            if [ "$REF" = "refs/heads/main" ] || [ "$REF" = "refs/heads/master" ]; then
-              add_tag "$DH_BASE" "latest"
-            fi
-          fi
-
-          # 去掉末尾空行
-          TAGS="$(printf '%s' "$TAGS" | sed '/^[[:space:]]*$/d')"
-
-          # ── Labels ────────────────────────────────────────────────
-          LABELS="org.opencontainers.image.title=Xboard FrankenPHP
-          org.opencontainers.image.description=High-performance Xboard panel powered by FrankenPHP
-          org.opencontainers.image.source=https://github.com/${UPSTREAM_REPO}
-          upstream.sha=${SHA}"
-
-          # ── 写入多行 output（使用 heredoc 分隔符）────────────────
+          # 拼 tags —— 每行一条 image:tag
           {
-            echo "tags<<__TAGS_EOF__"
-            printf '%s
-' "$TAGS"
-            echo "__TAGS_EOF__"
-            echo "labels<<__LABELS_EOF__"
-            printf '%s
-' "$LABELS"
-            echo "__LABELS_EOF__"
+            echo "${GHCR}:${VERSION}"
+            echo "${GHCR}:sha-${SHORT}"
+            $IS_DEFAULT_BRANCH && echo "${GHCR}:latest" || true
+            if [ -n "$DH_USER" ]; then
+              echo "docker.io/${DH_USER}/${IMAGE}:${VERSION}"
+              echo "docker.io/${DH_USER}/${IMAGE}:sha-${SHORT}"
+              $IS_DEFAULT_BRANCH && echo "docker.io/${DH_USER}/${IMAGE}:latest" || true
+            fi
+          } > /tmp/tags.txt
+
+          # 拼 labels
+          {
+            echo "org.opencontainers.image.title=Xboard FrankenPHP"
+            echo "org.opencontainers.image.description=High-performance Xboard panel powered by FrankenPHP"
+            echo "org.opencontainers.image.source=https://github.com/${UPSTREAM_REPO}"
+            echo "upstream.sha=${SHA}"
+          } > /tmp/labels.txt
+
+          echo "📦 Tags:"
+          cat /tmp/tags.txt
+
+          # 写入多行 GITHUB_OUTPUT（heredoc 格式）
+          {
+            echo "tags<<__EOF__"
+            cat /tmp/tags.txt
+            echo "__EOF__"
+            echo "labels<<__EOF__"
+            cat /tmp/labels.txt
+            echo "__EOF__"
           } >> "$GITHUB_OUTPUT"
 
-          echo "📦 Tags to push:"
-          printf '%s
-' "$TAGS"
-
-      # ── Build & Push ──
+      # ── Build & Push ────────────────────────────────────────────────
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: ./build-context
-          file: ./build-context/Dockerfile
+          file:    ./build-context/Dockerfile
           platforms: ${{ matrix.platform }}
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags:   ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.platform }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+          cache-to:   type=gha,mode=max,scope=${{ matrix.platform }}
           build-args: |
             UPSTREAM_SHA=${{ needs.check-upstream.outputs.upstream_sha }}
             UPSTREAM_VERSION=${{ needs.check-upstream.outputs.version_label }}
             BUILD_DATE=${{ github.event.repository.updated_at }}
 
-      # ── 保存最新构建 SHA ──
+      # ── 记录本次构建 SHA（仅 amd64 执行一次）───────────────────────
       - name: Save built SHA
         if: matrix.platform == 'linux/amd64'
         run: |
           echo "${{ needs.check-upstream.outputs.upstream_sha }}" > .last_built_sha
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .last_built_sha
-          git diff --staged --quiet || git commit -m "ci: update last built SHA [${{ needs.check-upstream.outputs.version_label }}]"
+          git diff --staged --quiet || \
+            git commit -m "ci: built ${{ needs.check-upstream.outputs.version_label }}"
           git push || true
 
-  # ──────────────────────────────────────────
-  # JOB 3: 多架构 Manifest 合并
-  # ──────────────────────────────────────────
+  # ════════════════════════════════════════════════════════════════
+  # JOB 3 — 合并多架构 Manifest
+  # ════════════════════════════════════════════════════════════════
   merge-manifests:
     name: 📦 Merge Multi-arch Manifests
     needs: [check-upstream, build]
@@ -391,20 +347,21 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create and push multi-arch manifest
+        env:
+          VERSION: ${{ needs.check-upstream.outputs.version_label }}
+          BASE:    ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
         run: |
-          VERSION="${{ needs.check-upstream.outputs.version_label }}"
-          BASE="ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}"
-
+          set -euo pipefail
           docker buildx imagetools create \
-            --tag "$BASE:latest" \
-            --tag "$BASE:$VERSION" \
-            "$BASE:$VERSION-linux-amd64" \
-            "$BASE:$VERSION-linux-arm64" 2>/dev/null || \
-          echo "Manifest merge skipped (single arch or already merged)"
+            --tag "${BASE}:latest" \
+            --tag "${BASE}:${VERSION}" \
+            "${BASE}:${VERSION}" \
+          && echo "✅ Manifest merged" \
+          || echo "⚠️  Manifest merge skipped (may already be merged)"
 
-  # ──────────────────────────────────────────
-  # JOB 4: 测试镜像
-  # ──────────────────────────────────────────
+  # ════════════════════════════════════════════════════════════════
+  # JOB 4 — Smoke Test
+  # ════════════════════════════════════════════════════════════════
   test:
     name: 🧪 Smoke Test
     needs: [check-upstream, build]
@@ -420,26 +377,30 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Pull and test image
+      - name: Run smoke tests
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ needs.check-upstream.outputs.version_label }}
         run: |
-          IMAGE="ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ needs.check-upstream.outputs.version_label }}"
+          set -euo pipefail
           docker pull "$IMAGE"
 
-          # 检查 PHP 版本
+          echo "── PHP version ──"
           docker run --rm "$IMAGE" php -v
 
-          # 检查 FrankenPHP 模块
-          docker run --rm "$IMAGE" php -m | grep -E "swoole|openswoole|pdo|redis|mbstring" || true
+          echo "── Loaded extensions ──"
+          docker run --rm "$IMAGE" php -m
 
-          # 快速健康检查（5 秒超时）
-          docker run --rm -d --name xboard-test -p 8080:80 "$IMAGE" || true
-          sleep 3
-          curl -sf http://localhost:8080/health || echo "Health endpoint not available (expected for first run)"
-          docker stop xboard-test 2>/dev/null || true
+          echo "── Quick boot test ──"
+          docker run --rm -d --name xboard-smoke -p 8080:80 "$IMAGE" || true
+          sleep 5
+          curl -fsS http://localhost:8080/health \
+            && echo "✅ Health check passed" \
+            || echo "⚠️  Health endpoint not ready (normal on first boot)"
+          docker stop xboard-smoke 2>/dev/null || true
 
-  # ──────────────────────────────────────────
-  # JOB 5: 发布 Release（仅 tag 触发）
-  # ──────────────────────────────────────────
+  # ════════════════════════════════════════════════════════════════
+  # JOB 5 — 创建 GitHub Release（仅当上游有 Tag 时）
+  # ════════════════════════════════════════════════════════════════
   release:
     name: 🏷️ Create GitHub Release
     needs: [check-upstream, test]
@@ -466,10 +427,10 @@ jobs:
             | 上游 SHA | `${{ needs.check-upstream.outputs.upstream_sha }}` |
             | 构建时间 | `${{ github.event.repository.updated_at }}` |
 
-            ## Docker 镜像
+            ## 拉取镜像
 
             ```bash
-            # GHCR
+            # GHCR（推荐）
             docker pull ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ needs.check-upstream.outputs.version_label }}
 
             # Latest
@@ -481,12 +442,17 @@ jobs:
             ```bash
             docker run -d \
               --name xboard \
-              -p 80:80 \
-              -v ./data:/app/storage \
-              -e APP_KEY=your-app-key \
+              -p 80:80 -p 443:443 -p 443:443/udp \
+              -e APP_KEY=base64:your_key \
+              -e DB_HOST=your-db \
+              -e DB_DATABASE=xboard \
+              -e DB_USERNAME=xboard \
+              -e DB_PASSWORD=your_password \
+              -e REDIS_HOST=your-redis \
+              -v xboard_storage:/app/storage \
               ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
             ```
 
-            > 基于 [cedar2025/Xboard](${{ env.UPSTREAM_REPO }}) 上游构建，运行时替换为 FrankenPHP 高性能服务器。
+            > 基于 [cedar2025/Xboard](https://github.com/${{ env.UPSTREAM_REPO }}) 构建，运行时替换为 FrankenPHP Worker 模式。
           draft: false
           prerelease: false
