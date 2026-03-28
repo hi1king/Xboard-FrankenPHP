@@ -1,0 +1,65 @@
+{
+    # ── FrankenPHP Global Options ──────────────────────────────────
+    frankenphp
+
+    # 关闭自动 HTTPS（容器内使用反向代理时）
+    # auto_https off
+
+    # 调整日志格式
+    log {
+        level INFO
+        format json
+    }
+
+    # 性能调优
+    servers {
+        protocols h1 h2 h3
+    }
+}
+
+# ── HTTP 站点配置 ──────────────────────────────────────────────────
+:80 {
+    root * /app/public
+
+    # 健康检查端点
+    respond /health 200 {
+        body "OK"
+    }
+
+    # 访问日志
+    log {
+        output file /app/storage/logs/access.log {
+            roll_size 50mb
+            roll_keep 10
+        }
+        format json
+    }
+
+    # 压缩
+    encode gzip zstd
+
+    # 安全 Headers
+    header {
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        X-XSS-Protection "1; mode=block"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        -Server
+    }
+
+    # 静态资源缓存（Laravel Mix / Vite 哈希文件名）
+    @static {
+        path /build/* /css/* /js/* /images/* /fonts/* /favicon.ico /robots.txt
+    }
+    header @static Cache-Control "public, max-age=31536000, immutable"
+
+    # PHP 处理（FrankenPHP worker 模式）
+    php_server {
+        # Worker 模式：预加载 Laravel，大幅提升性能
+        worker {
+            file /app/docker/worker.php
+            num {$FRANKENPHP_WORKERS:4}
+        }
+        resolve_root_symlink
+    }
+}

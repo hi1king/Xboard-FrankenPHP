@@ -1,0 +1,136 @@
+name: xboard-frankenphp
+
+# ══════════════════════════════════════════════════════════════════
+#  Xboard FrankenPHP — Local Dev / Prod Compose
+# ══════════════════════════════════════════════════════════════════
+
+services:
+  # ── Xboard App (FrankenPHP) ─────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        UPSTREAM_VERSION: local-dev
+    image: xboard-frankenphp:local
+    container_name: xboard-app
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+      - "${HTTPS_PORT:-443}:443/udp"   # HTTP/3 (QUIC)
+    environment:
+      # Laravel
+      APP_ENV: ${APP_ENV:-production}
+      APP_DEBUG: ${APP_DEBUG:-false}
+      APP_KEY: ${APP_KEY:-}
+      APP_URL: ${APP_URL:-http://localhost}
+      APP_TIMEZONE: ${APP_TIMEZONE:-Asia/Shanghai}
+      # Database
+      DB_CONNECTION: mysql
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_DATABASE: ${DB_DATABASE:-xboard}
+      DB_USERNAME: ${DB_USERNAME:-xboard}
+      DB_PASSWORD: ${DB_PASSWORD:-xboard_secret}
+      # Redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      CACHE_DRIVER: redis
+      SESSION_DRIVER: redis
+      QUEUE_CONNECTION: redis
+      # FrankenPHP
+      FRANKENPHP_WORKERS: ${FRANKENPHP_WORKERS:-4}
+      QUEUE_WORKERS: ${QUEUE_WORKERS:-2}
+      QUEUE_NAME: ${QUEUE_NAME:-default}
+      # Supervisor
+      ENABLE_SUPERVISOR: "true"
+    volumes:
+      - app_storage:/app/storage
+      - app_logs:/app/storage/logs
+      - ./.env:/app/.env:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - xboard-net
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ── MySQL 8.0 ────────────────────────────────────────────────────
+  mysql:
+    image: mysql:8.0
+    container_name: xboard-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root_secret}
+      MYSQL_DATABASE: ${DB_DATABASE:-xboard}
+      MYSQL_USER: ${DB_USERNAME:-xboard}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-xboard_secret}
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docker/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    command: >
+      mysqld
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --innodb-buffer-pool-size=256M
+      --max-connections=300
+    networks:
+      - xboard-net
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-root_secret}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ── Redis 7 ──────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: xboard-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+      ${REDIS_PASSWORD:+--requirepass "$REDIS_PASSWORD"}
+    volumes:
+      - redis_data:/data
+    networks:
+      - xboard-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── (Optional) Nginx reverse proxy ───────────────────────────────
+  # Uncomment when running behind Nginx for SSL termination
+  # nginx:
+  #   image: nginx:1.25-alpine
+  #   container_name: xboard-nginx
+  #   ports: ["80:80", "443:443"]
+  #   volumes:
+  #     - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+  #     - ./docker/nginx/ssl:/etc/nginx/ssl:ro
+  #   depends_on: [app]
+  #   networks: [xboard-net]
+
+volumes:
+  app_storage:
+  app_logs:
+  mysql_data:
+  redis_data:
+
+networks:
+  xboard-net:
+    driver: bridge
